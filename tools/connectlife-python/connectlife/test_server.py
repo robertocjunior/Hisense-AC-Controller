@@ -1,0 +1,465 @@
+import asyncio
+import base64
+import datetime as dt
+import functools
+import hashlib
+import hmac
+from random import randrange
+
+from aiohttp import web
+from yarl import URL
+import argparse
+import json
+import re
+from os import listdir
+from os.path import isfile, join
+
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+from connectlife.api import GATEWAY_INVALID_ACCESS_TOKEN
+from connectlife.oauth import OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET
+from connectlife.trir import (
+    TRIR_AES_IV,
+    TRIR_AES_KEY,
+    TRIR_APPS,
+    TRIR_TRANSPORT_MAGIC,
+    TRIR_VENDOR_SECRET,
+)
+
+appliances = {}
+failure_rate = 0
+timeout_rate = 0
+auth_error_rate = 0
+auth_error_type = "invalid_login"
+reject_tokens = False
+
+LOGIN_ERRORS = {
+    "invalid_login": {
+        "errorCode": 403042,
+        "errorMessage": "Invalid LoginID",
+        "errorDetails": "invalid loginID or password",
+    },
+    "pending_registration": {
+        "errorCode": 206001,
+        "errorMessage": "Account Pending Registration",
+        "errorDetails": "Missing required fields for registration: preferences.terms.connectlife_terms_conditions.isConsentGranted, preferences.privacy.connectlife_privacy_policy.isConsentGranted",
+    },
+}
+
+async def login(request):  # noqa: ARG001
+    if auth_error_rate > randrange(100):
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps(LOGIN_ERRORS[auth_error_type]),
+        )
+    return web.Response(
+        content_type="application/json",
+        text='{"UID": "123", "sessionInfo":{"cookieValue": "my_login_token"}}'
+    )
+
+async def get_jwt(request):
+    return web.Response(
+        content_type="application/json",
+        text='{"id_token": "my_id_token"}'
+    )
+
+async def authorize(request):
+    return web.Response(
+        content_type="application/json",
+        text='{"code": "my_authorization_token"}'
+    )
+
+async def oauth_login(request):
+    """Browser OAuth login page: signs in at once and redirects back with a code."""
+    redirect_uri = request.query.get("redirect_uri")
+    if not redirect_uri:
+        return web.Response(status=400, text="Missing redirect_uri")
+    location = URL(redirect_uri).update_query(
+        code="my_authorization_token", state=request.query.get("state", "")
+    )
+    raise web.HTTPFound(location)
+
+async def token(request):
+    return web.Response(
+        content_type="application/json",
+        text='{"access_token": "my_access_token", "expires_in": 86400, "refresh_token": "my_refresh_token"}'
+    )
+
+def _gateway_ok(data=None):
+    """Return a successful HijuConn gateway response."""
+    response = {"resultCode": 0}
+    if data is not None:
+        response.update(data)
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps({"response": response}),
+    )
+
+def _gateway_error(error_code, error_desc):
+    """Return an error HijuConn gateway response."""
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps({"response": {
+            "resultCode": 1,
+            "errorCode": error_code,
+            "errorDesc": error_desc,
+        }}),
+    )
+
+def juapi(handler):
+    """Also serve a route as the third-party API (juapi-3rd), used with OAuth tokens.
+
+    Requests signed with the ``hi-params-encrypt`` header get their HMAC signature
+    checked, and a flat reply instead of one wrapped in ``response``.
+    """
+    @functools.wraps(handler)
+    async def wrapper(request):
+        if "hi-params-encrypt" not in request.headers:
+            return await handler(request)
+        if not _juapi_signature_valid(request):
+            return web.Response(
+                content_type="application/json",
+                text=json.dumps({"resultCode": 1, "errorCode": 600912, "errorDesc": "Signature mismatch"}),
+            )
+        response = await handler(request)
+        if response.content_type == "application/json":
+            body = json.loads(response.text)
+            if isinstance(body.get("response"), dict):
+                response.text = json.dumps(body["response"])
+        return response
+    return wrapper
+
+def _juapi_signature_valid(request):
+    app_id = request.headers.get("hi-params-encrypt")
+    match = re.search(r'signature="([^"]+)"', request.headers.get("Authorization", ""))
+    if app_id != OAUTH2_CLIENT_ID or not match:
+        return False
+    signing_string = (
+        f"{app_id}\n{request.method} {request.path_qs}\ndate: {request.headers.get('Date', '')}\n"
+        f"hi-params-encrypt: {app_id}\n"
+    )
+    expected = base64.b64encode(
+        hmac.new(OAUTH2_CLIENT_SECRET.encode(), signing_string.encode(), hashlib.sha256).digest()
+    ).decode()
+    return hmac.compare_digest(match.group(1), expected)
+
+async def get_device_status_list(request):
+    if reject_tokens:
+        # Simulate the cloud invalidating the session, forcing a full re-login.
+        return _gateway_error(GATEWAY_INVALID_ACCESS_TOKEN, "Invalid access token")
+    if failure_rate > randrange(100):
+        return web.Response(status=500)
+    if timeout_rate > randrange(100):
+        await asyncio.sleep(10.1)
+    return _gateway_ok({"deviceList": list(appliances.values())})
+
+async def property_set(request):
+    req = await request.json()
+    puid = req.get("puid")
+    properties = req.get("properties", {})
+    if puid not in appliances:
+        return _gateway_error(404, f"Unknown puid {puid}")
+    appliance = appliances[puid]
+    unknowns = [key for key in properties if key not in appliance["statusList"]]
+    if unknowns:
+        return _gateway_error(400, f"Unknown properties {unknowns}")
+    for key in properties:
+        appliance["statusList"][key] = properties[key]
+    return _gateway_ok()
+
+async def air_duct_energy(request):
+    req = await request.json()
+    puid = req.get("puid")
+    if puid not in appliances:
+        return _gateway_error(404, f"Unknown puid {puid}")
+    hours = [str(h) for h in range(24)]
+    return _gateway_ok({
+        "type": req.get("statType", "day"),
+        "dateStart": req.get("dateStart"),
+        "dateEnd": req.get("dateEnd"),
+        "resultData": {
+            "electricTotal": 0.0,
+            "costTotal": "0.00",
+            "durationTotal": 0,
+            "electricCurve": {h: "0.00" for h in hours},
+            "costCurve": {h: "0.00" for h in hours},
+            "coolingCurve": {h: "0" for h in hours},
+            "heatingCurve": {h: "0" for h in hours},
+        },
+    })
+
+async def energy_consumption_curve(request):
+    req = await request.json()
+    puid = req.get("puid")
+    if puid not in appliances:
+        return _gateway_error(404, f"Unknown puid {puid}")
+    # Per-day curve across [dateStart, dateEnd] (incl. today) so clients reading
+    # curve[today] get a value — the real gateway returns a per-day curve. Sample
+    # non-zero values so the daily sensors visibly populate. Year statType uses
+    # YYYY-MM dates and, like the real gateway, a per-month curve keyed "01".."12".
+    # Month and year also get the "all" period-total key some devices return.
+    electric_curve: dict[str, str] = {}
+    water_curve: dict[str, str] = {}
+    if req.get("statType") == "year":
+        for month in range(1, 13):
+            electric_curve[f"{month:02d}"] = "1.0"
+            water_curve[f"{month:02d}"] = "11.0"
+    else:
+        try:
+            day = dt.date.fromisoformat(req["dateStart"])
+            end = dt.date.fromisoformat(req["dateEnd"])
+            while day <= end:
+                electric_curve[day.isoformat()] = "1.0"
+                water_curve[day.isoformat()] = "11.0"
+                day += dt.timedelta(days=1)
+        except (KeyError, ValueError):
+            pass
+    buckets = len(electric_curve)
+    electric_usage = f"{buckets:.2f}"
+    water_usage = f"{buckets * 11:.2f}"
+    if req.get("statType") in ("month", "year"):
+        electric_curve["all"] = electric_usage
+        water_curve["all"] = water_usage
+    return _gateway_ok({
+        "type": req.get("statType", "week"),
+        "deviceType": req.get("deviceType"),
+        "resultData": {
+            "electricUsage": electric_usage,
+            "waterUsage": water_usage,
+            "normElectricUsage": "0.00",
+            "normWaterUsage": "0.00",
+            "runTimes": "0.00",
+            "cycles": buckets,
+            "electricCurve": electric_curve,
+            "waterCurve": water_curve,
+            "programResult": [],
+            "energyPeriod": [],
+        },
+    })
+
+async def query_static_data(request):
+    req = await request.json()
+    puid = req.get("puid")
+    if puid not in appliances:
+        return _gateway_error(404, f"Unknown puid {puid}")
+    # Stub mirrors the real response shape: it echoes the puid (so the dump tool
+    # has something to redact) and nests capability data under "data". The feature
+    # code is echoed there so per-puid responses differ between devices.
+    appliance = appliances[puid]
+    return _gateway_ok({
+        "puid": puid,
+        "dev_type": appliance.get("deviceTypeCode"),
+        "wifi_id": None,
+        "device_id": None,
+        "data": {"deviceFeatureCode": appliance.get("deviceFeatureCode")},
+    })
+
+async def query_system_data(request):
+    req = await request.json()
+    puid = req.get("puid")
+    if puid not in appliances:
+        return _gateway_error(404, f"Unknown puid {puid}")
+    appliance = appliances[puid]
+    # Like the real response, a list of programs with the options they allow.
+    return _gateway_ok({
+        "puid": puid,
+        "dev_type": appliance.get("deviceTypeCode"),
+        "wifi_id": None,
+        "device_id": None,
+        "data": [
+            {"Program_id": 0, "Program_position": 0, "Program_visible": 2, "Program_duration": 202},
+            {"Program_id": 1, "Program_position": 1, "Program_visible": 2, "Program_duration": 131},
+        ],
+    })
+
+async def self_check(request):
+    req = await request.json()
+    puid = req.get("puid")
+    if puid not in appliances:
+        return _gateway_error(404, f"Unknown puid {puid}")
+    appliance = appliances[puid]
+    return _gateway_ok({"data": {
+        "puid": puid,
+        "deviceType": appliance.get("deviceTypeCode"),
+        "featureCode": appliance.get("deviceFeatureCode"),
+        "selfCheckList": [{"statusKey": "Error-F11", "statusValue": "2", "content": "Water outlet"}],
+        "selfCheckFailedList": [],
+    }})
+
+async def hour_power(request):
+    req = await request.json()
+    puid = req.get("puid")
+    if puid not in appliances:
+        return _gateway_error(404, f"Unknown puid {puid}")
+    return _gateway_ok({"powerConsumption": {str(hour): "0.00" for hour in range(24)}})
+
+async def get_property_list(request):  # noqa: ARG001
+    return _gateway_ok({"properties": []})
+
+# -- TRIR (Russia/CIS) backend ---------------------------------------------
+
+# Canned tokens returned by the TRIR login/refresh endpoints. The *ExpiredTime
+# fields are lifetimes in seconds, matching the real gateway.
+TRIR_TOKENS = {
+    "customerId": "12345678901234567",
+    "accessToken": "trir_access_token",
+    "accessTokenCreateTime": 0,
+    "accessTokenExpiredTime": 86400,
+    "refreshToken": "trir_refresh_token",
+    "refreshTokenExpiredTime": 2592000,
+}
+
+
+def _trir_ok(data=None):
+    """Return a successful TRIR gateway response envelope."""
+    response = {"resultCode": 0, "errorCode": 0, "errorDesc": None}
+    if data is not None:
+        response.update(data)
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps({"response": response, "signatureServer": "test"}),
+    )
+
+
+def _trir_error(error_code, error_desc):
+    """Return a TRIR error response envelope."""
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps({"response": {
+            "resultCode": 1,
+            "errorCode": error_code,
+            "errorDesc": error_desc,
+        }, "signatureServer": "test"}),
+    )
+
+
+def _trir_decode_body(body: str) -> dict:
+    """Decode a TRIR request body (HENC-wrapped or plain JSON) to a dict."""
+    if body.startswith(TRIR_TRANSPORT_MAGIC):
+        ciphertext = base64.b64decode(body[len(TRIR_TRANSPORT_MAGIC):])
+        decryptor = Cipher(algorithms.AES(TRIR_AES_KEY), modes.CBC(TRIR_AES_IV)).decryptor()
+        padded = decryptor.update(ciphertext) + decryptor.finalize()
+        unpadder = sym_padding.PKCS7(128).unpadder()
+        body = (unpadder.update(padded) + unpadder.finalize()).decode()
+    return json.loads(body)
+
+
+def _trir_app_secret(app_id):
+    for app in TRIR_APPS.values():
+        if app["app_id"] == app_id:
+            return app["app_secret"]
+    return None
+
+
+def _trir_expected_sign(data: dict, app_secret: str) -> str:
+    items = []
+    for key in sorted(k for k in data if k != "sign"):
+        value = data[key]
+        if not value:
+            continue
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, separators=(",", ":"))
+        items.append(f"{key}={value}")
+    sign_str = f"{app_secret}{'&'.join(items)}{TRIR_VENDOR_SECRET}"
+    return hashlib.sha1(sign_str.encode()).hexdigest()
+
+
+def _trir_verify(data: dict):
+    """Return an error Response if the request is malformed, else None."""
+    app_secret = _trir_app_secret(data.get("appId"))
+    if app_secret is None:
+        return _trir_error(600902, f"Unknown appId {data.get('appId')}")
+    if data.get("sign") != _trir_expected_sign(data, app_secret):
+        return _trir_error(600903, "Signature mismatch")
+    return None
+
+
+async def trir_login(request):
+    try:
+        data = _trir_decode_body(await request.text())
+    except Exception as err:  # noqa: BLE001
+        return _trir_error(600901, f"Unable to decode request body: {err}")
+    if auth_error_rate > randrange(100):
+        return _trir_error(600904, "User name or password error")
+    if (error := _trir_verify(data)) is not None:
+        return error
+    return _trir_ok(TRIR_TOKENS)
+
+
+async def trir_refresh_token(request):
+    data = _trir_decode_body(await request.text())
+    if (error := _trir_verify(data)) is not None:
+        return error
+    return _trir_ok(TRIR_TOKENS)
+
+
+async def trir_device_tab_list(request):  # noqa: ARG001
+    if failure_rate > randrange(100):
+        return web.Response(status=500)
+    if timeout_rate > randrange(100):
+        await asyncio.sleep(10.1)
+    return _trir_ok({
+        "deviceList": list(appliances.values()),
+        "tabCardList": [],
+        "roomList": [],
+        "floorList": [],
+        "locationList": None,
+        "ext": {},
+    })
+
+
+def main(args):
+    directory = args.directory
+    filenames = list(filter(lambda f: f[-5:] == ".json", [f for f in listdir(directory) if isfile(join(directory, f))]))
+    for filename in filenames:
+        with (open(join(directory, filename)) as f):
+            appliance = json.load(f)
+            appliance["deviceId"] = filename[0:-5]
+            appliance["puid"] = f"puid{appliance['deviceId']}"
+            # Expose both feature code fields so a single running server can
+            # serve EU (deviceFeatureCode) and TRIR (featureCode) clients,
+            # regardless of which dump format the base file uses.
+            feature = appliance.get("deviceFeatureCode") or appliance.get("featureCode")
+            appliance["deviceFeatureCode"] = feature
+            appliance["featureCode"] = feature
+            appliance["deviceNickName"] = f'{appliance["deviceNickName"]} ({appliance["deviceTypeCode"]}-{feature})'
+            appliances[appliance["puid"]] = appliance
+
+    app = web.Application()
+    app.add_routes([web.post('/accounts.login', login)])
+    app.add_routes([web.post('/accounts.getJWT', get_jwt)])
+    app.add_routes([web.get('/login', oauth_login)])
+    app.add_routes([web.post('/oauth/authorize', authorize)])
+    app.add_routes([web.post('/oauth/token', token)])
+    app.add_routes([web.get('/clife-svc/pu/get_device_status_list', juapi(get_device_status_list))])
+    app.add_routes([web.post('/device/pu/property/set', juapi(property_set))])
+    app.add_routes([web.post('/clife-svc/pu/air_duct_energy', air_duct_energy)])
+    app.add_routes([web.post('/clife-svc/pu/energyConsumptionCurve', energy_consumption_curve)])
+    app.add_routes([web.post('/clife-svc/pu/query_static_data', juapi(query_static_data))])
+    app.add_routes([web.get('/clife-svc/get_property_list', juapi(get_property_list))])
+    app.add_routes([web.post('/clife-svc/pu/query_system_data', juapi(query_system_data))])
+    app.add_routes([web.post('/basic/self_check/info', juapi(self_check))])
+    app.add_routes([web.post('/clife-svc/pu/get_hour_power', juapi(hour_power))])
+    # TRIR (Russia/CIS) backend. property/set and air_duct_energy are shared.
+    app.add_routes([web.post('/account/acc/login_pwd', trir_login)])
+    app.add_routes([web.post('/account/acc/refresh_token', trir_refresh_token)])
+    app.add_routes([web.post('/br/getDeviceTabList', trir_device_tab_list)])
+    web.run_app(app, port=args.port)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(prog='ConnectLife API test server')
+    parser.add_argument('-p', '--port', type=int, default=8080, help='Port on which to serve the web app')
+    parser.add_argument('-d', '--directory', default='.', help='Directory to read dump files from')
+    parser.add_argument('-a', '--auth_error_rate', type=int, default=0, help='Auth error rate in %% for login')
+    parser.add_argument('--auth_error_type', choices=list(LOGIN_ERRORS.keys()), default='invalid_login', help='Type of auth error to simulate')
+    parser.add_argument('--reject_tokens', action='store_true', help='Reject access tokens when getting appliances, forcing a re-login')
+    parser.add_argument('-f', '--failure_rate', type=int, default=0, help='Failure rate in %% for get appliances')
+    parser.add_argument('-t', '--timeout_rate', type=int, default=0, help='Timeout rate in %% for get appliances')
+    args = parser.parse_args()
+    auth_error_rate = args.auth_error_rate
+    auth_error_type = args.auth_error_type
+    reject_tokens = args.reject_tokens
+    failure_rate = args.failure_rate
+    timeout_rate = args.timeout_rate
+    main(args)

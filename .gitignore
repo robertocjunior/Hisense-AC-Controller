@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+package-lock.json.bak
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native Android
+android/build/
+android/app/build/
+android/.gradle/
+android/app/.cxx/
+local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# macOS & OS files
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
