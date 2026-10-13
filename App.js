@@ -258,7 +258,7 @@ export default function App() {
     if (currentAppliance?.status?.t_super == '1') {
       opt.t_super = '0';
     }
-    dispatchOptimistic(opt, { t_temp: String(next) });
+    dispatchOptimistic(opt);
   };
 
   const adjustTemp = (delta) => {
@@ -271,7 +271,7 @@ export default function App() {
     if (code !== '2' && currentAppliance?.status?.t_super == '1') {
       opt.t_super = '0';
     }
-    dispatchOptimistic(opt, { t_work_mode: String(code) });
+    dispatchOptimistic(opt);
   };
 
   const setFanSpeed = (speedCode) => {
@@ -282,7 +282,7 @@ export default function App() {
     if (speedCode !== '9' && currentAppliance?.status?.t_super == '1') {
       opt.t_super = '0';
     }
-    dispatchOptimistic(opt, { t_fan_speed: String(speedCode) });
+    dispatchOptimistic(opt);
   };
 
   const toggleSwing = () => {
@@ -296,17 +296,26 @@ export default function App() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     const isCurrentlyOn = currentAppliance?.status?.t_super == '1';
     if (!isCurrentlyOn) {
-      dispatchOptimistic(
-        {
-          t_super: '1',
-          t_work_mode: '2',
-          t_fan_speed: '9',
-          t_fan_mute: '0',
-          t_eco: '0',
-          t_sleep: '0',
-        },
-        { t_super: '1' }
-      );
+      const mode = currentAppliance?.status?.t_work_mode;
+      const isHeat = mode === '1';
+      const turboTemp = isHeat ? '30' : '16';
+      const targetMode = isHeat ? '1' : '2';
+
+      const opt = {
+        t_super: '1',
+        t_temp: turboTemp,
+        t_work_mode: targetMode,
+        t_fan_speed: '9',
+        t_fan_mute: '0',
+        t_eco: '0',
+        t_sleep: '0',
+      };
+
+      dispatchOptimistic(opt, {
+        t_super: '1',
+        t_temp: turboTemp,
+        t_work_mode: targetMode,
+      });
     } else {
       dispatchOptimistic({ t_super: '0' });
     }
