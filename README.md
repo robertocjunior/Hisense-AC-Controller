@@ -25,7 +25,7 @@
 
 Você pode baixar diretamente a versão compilada e pronta para instalar no seu celular Android:
 
-➡️ **[Baixar Hisense-AC-Controller.apk (Versão 1.0.0)](https://github.com/robertocjunior/Hisense-AC-Controller/releases/download/v1.0.0/Hisense-AC-Controller.apk)**
+➡️ **[Baixar Hisense-AC-Controller.apk (Versão 1.0.1)](https://github.com/robertocjunior/Hisense-AC-Controller/releases/download/v1.0.1/Hisense-AC-Controller.apk)**
 
 *(Ou acesse a aba [Releases](https://github.com/robertocjunior/Hisense-AC-Controller/releases) para ver todas as versões).*
 
