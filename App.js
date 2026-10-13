@@ -313,8 +313,6 @@ export default function App() {
 
       dispatchOptimistic(opt, {
         t_super: '1',
-        t_temp: turboTemp,
-        t_work_mode: targetMode,
       });
     } else {
       dispatchOptimistic({ t_super: '0' });
@@ -355,7 +353,11 @@ export default function App() {
   // Appliance state extraction
   const statusObj = currentAppliance?.status || currentAppliance?.statusList || {};
   const isPowerOn = statusObj.t_power == '1';
-  const targetTemp = parseInt(statusObj.t_temp || '26', 10);
+  const isFastCooling = statusObj.t_super == '1';
+  const workMode = String(statusObj.t_work_mode || '2');
+  const targetTemp = isFastCooling
+    ? (workMode === '1' ? 30 : 16)
+    : parseInt(statusObj.t_temp || '26', 10);
   const rawAmbient =
     statusObj.f_temp_in ??
     statusObj.t_indoortemp_detection ??
@@ -368,11 +370,9 @@ export default function App() {
         ? String(rawAmbient)
         : `${rawAmbient}°C`
       : '--°C';
-  const workMode = String(statusObj.t_work_mode || '2');
   const curFan = String(statusObj.t_fan_speed || '0');
   const isMute = statusObj.t_fan_mute == '1';
   const isSwing = statusObj.t_up_down == '1';
-  const isFastCooling = statusObj.t_super == '1';
   const isSleep = statusObj.t_sleep == '1';
   const isEco = statusObj.t_eco == '1';
 
